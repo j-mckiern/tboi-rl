@@ -43,7 +43,7 @@ def _fake_game(port: int, received: list[dict]) -> None:
     """Behaves like the Lua mod: hello, then one state/reply exchange."""
     with socket.create_connection(("127.0.0.1", port)) as conn:
         reader = conn.makefile("rb")
-        conn.sendall(encode({"type": "hello", "protocol": 1, "frame_skip": 2}))
+        conn.sendall(encode({"type": "hello", "protocol": 2, "frame_skip": 2}))
         conn.sendall(encode({"type": "state", "step": 0, "new_run": True}))
         received.append(json.loads(reader.readline()))
 
@@ -71,7 +71,7 @@ def test_server_raises_on_game_error():
     with BridgeServer(port=0) as server:
         def game():
             with socket.create_connection(("127.0.0.1", server.address[1])) as conn:
-                conn.sendall(encode({"type": "hello", "protocol": 1, "frame_skip": 2}))
+                conn.sendall(encode({"type": "hello", "protocol": 2, "frame_skip": 2}))
                 conn.sendall(encode({"type": "error", "message": "invalid seed: XXXX XXXX"}))
                 conn.recv(1)  # stay connected until the server closes
 

@@ -18,10 +18,18 @@ local json = require("json")
 
 local HOST = "127.0.0.1"
 local PORT = 5577
+local PROTOCOL_VERSION = 2
 local FRAME_SKIP = 2            -- game updates (30 per second) per agent step
-local RECV_TIMEOUT = 10         -- seconds to wait for the agent before dropping the connection
+local RECV_TIMEOUT = 300        -- seconds to wait for the agent (covers PPO updates) before dropping it
 local RECONNECT_INTERVAL = 60   -- render frames (60 per second) between connection attempts
-local PROTOCOL_VERSION = 1
+local RESET_TIMEOUT = 300       -- render frames to wait for a requested restart to finish
+local GOTO_TIMEOUT = 60         -- render frames to wait for a teleport (fails fast on unknown rooms)
+
+-- Per-message caps on entity lists, nearest to the player first.
+local MAX_ENEMIES = 32
+local MAX_PROJECTILES = 64
+local MAX_PICKUPS = 16
+local MAX_HAZARDS = 16
 
 local hasSocket, socket = pcall(require, "socket")
 if hasSocket then
@@ -29,18 +37,22 @@ if hasSocket then
 else
     Isaac.DebugString("[TBOI-RL] loaded, LuaSocket unavailable: " .. tostring(socket))
 end
-local lastConnectError = nil
 
 local client = nil
 local lastConnectAttempt = -RECONNECT_INTERVAL
+local lastConnectError = nil
 local updateCounter = 0
 local stepCount = 0
-local resetting = false      -- waiting for a requested restart to finish
-local newRun = false         -- next state message is the first of a new run
-local pendingCommand = nil   -- console command to run on the next render frame
-local resetStartedAt = 0
-local RESET_TIMEOUT = 300    -- render frames to wait for a requested restart
 local statusText = ""
+
+-- Reset in progress: { phase = "restart" | "goto", room = string|nil, startedAt = frame }
+local reset = nil
+local newRun = false         -- next state message is the first of a new episode
+local pendingCommand = nil   -- console command to run on the next render frame
+
+-- Running totals since the mod loaded. Python takes differences between
+-- consecutive states, so these never need resetting.
+local counters = { kills = 0, damage_dealt = 0, hits_taken = 0 }
 
 -- Current action, held between agent steps.
 local currentMove = 0
@@ -78,6 +90,15 @@ local CONTROLLED_ACTIONS = {
     [ButtonAction.ACTION_SHOOTDOWN] = true,
 }
 
+-- One character per grid cell, row-major. Decoded by tboi_rl/obs.py.
+local CELL_EMPTY = "0"
+local CELL_WALL = "1"
+local CELL_OBSTACLE = "2"
+local CELL_PIT = "3"
+local CELL_SPIKES = "4"
+local CELL_DOOR_CLOSED = "5"
+local CELL_DOOR_OPEN = "6"
+
 ---------------------------------------------------------------------------
 -- Connection handling
 ---------------------------------------------------------------------------
@@ -88,7 +109,7 @@ local function disconnect(reason)
         client = nil
     end
     currentMove, currentShoot = 0, 0
-    resetting = false
+    reset = nil
     statusText = "disconnected (" .. tostring(reason) .. ")"
     Isaac.DebugString("[TBOI-RL] disconnected: " .. tostring(reason))
 end
@@ -137,11 +158,80 @@ end
 -- State serialization
 ---------------------------------------------------------------------------
 
+local function round(v)
+    return math.floor(v * 100 + 0.5) / 100
+end
+
+-- Encodes the room layout as one character per grid cell (see CELL_*).
+local function encodeGrid(room)
+    local cells = {}
+    for i = 0, room:GetGridSize() - 1 do
+        local cell = CELL_EMPTY
+        local ge = room:GetGridEntity(i)
+        local gtype = ge and ge:GetType() or nil
+        if gtype == GridEntityType.GRID_DOOR then
+            local door = ge:ToDoor()
+            cell = (door and door:IsOpen()) and CELL_DOOR_OPEN or CELL_DOOR_CLOSED
+        elseif gtype == GridEntityType.GRID_SPIKES or gtype == GridEntityType.GRID_SPIKES_ONOFF then
+            cell = CELL_SPIKES
+        else
+            local coll = room:GetGridCollision(i)
+            if coll == GridCollisionClass.COLLISION_WALL or coll == GridCollisionClass.COLLISION_WALL_EXCEPT_PLAYER then
+                cell = CELL_WALL
+            elseif coll == GridCollisionClass.COLLISION_PIT then
+                cell = CELL_PIT
+            elseif coll == GridCollisionClass.COLLISION_OBJECT or coll == GridCollisionClass.COLLISION_SOLID then
+                cell = CELL_OBSTACLE
+            end
+        end
+        cells[#cells + 1] = cell
+    end
+    return table.concat(cells)
+end
+
+-- Keeps the `limit` entries closest to the player.
+local function nearest(list, limit)
+    table.sort(list, function(a, b) return a.dist < b.dist end)
+    local out = {}
+    for i = 1, math.min(#list, limit) do
+        out[i] = list[i].data
+    end
+    return out
+end
+
+local function collectEntities(playerPos)
+    local enemies, projectiles, pickups, hazards = {}, {}, {}, {}
+    for _, e in ipairs(Isaac.GetRoomEntities()) do
+        local p, v = e.Position, e.Velocity
+        local dist = p:Distance(playerPos)
+        local friendly = e:HasEntityFlags(EntityFlag.FLAG_FRIENDLY)
+        if e.Type == EntityType.ENTITY_PROJECTILE then
+            projectiles[#projectiles + 1] = { dist = dist, data = { round(p.X), round(p.Y), round(v.X), round(v.Y) } }
+        elseif e.Type == EntityType.ENTITY_PICKUP then
+            pickups[#pickups + 1] = { dist = dist, data = { e.Variant, e.SubType, round(p.X), round(p.Y) } }
+        elseif e.Type == EntityType.ENTITY_FIREPLACE then
+            if e.HitPoints > 1 then  -- extinguished fires keep 1 HP
+                hazards[#hazards + 1] = { dist = dist, data = { e.Type, e.Variant, round(p.X), round(p.Y) } }
+            end
+        elseif e:IsActiveEnemy(false) and not friendly then
+            enemies[#enemies + 1] = { dist = dist, data = {
+                e.Type, e.Variant, round(p.X), round(p.Y), round(v.X), round(v.Y),
+                round(e.HitPoints), round(e.MaxHitPoints),
+                e:IsVulnerableEnemy() and 1 or 0, e:IsBoss() and 1 or 0,
+            } }
+        end
+    end
+    return nearest(enemies, MAX_ENEMIES), nearest(projectiles, MAX_PROJECTILES),
+        nearest(pickups, MAX_PICKUPS), nearest(hazards, MAX_HAZARDS)
+end
+
 local function getState()
     local game = Game()
     local level = game:GetLevel()
     local room = game:GetRoom()
     local player = Isaac.GetPlayer(0)
+    local origin = room:GetGridPosition(0)
+    local enemies, projectiles, pickups, hazards = collectEntities(player.Position)
 
     return {
         type = "state",
@@ -150,20 +240,85 @@ local function getState()
         new_run = newRun,
         seed = game:GetSeeds():GetStartSeedString(),
         stage = level:GetStage(),
+        counters = { kills = counters.kills, damage_dealt = round(counters.damage_dealt), hits_taken = counters.hits_taken },
         player = {
-            pos = { player.Position.X, player.Position.Y },
-            vel = { player.Velocity.X, player.Velocity.Y },
+            pos = { round(player.Position.X), round(player.Position.Y) },
+            vel = { round(player.Velocity.X), round(player.Velocity.Y) },
             hearts = player:GetHearts(),
             max_hearts = player:GetMaxHearts(),
             soul_hearts = player:GetSoulHearts(),
             dead = player:IsDead(),
+            damage = round(player.Damage),
+            fire_delay = round(player.MaxFireDelay),
+            shot_speed = round(player.ShotSpeed),
+            move_speed = round(player.MoveSpeed),
+            range = round(player.TearRange),
+            coins = player:GetNumCoins(),
+            bombs = player:GetNumBombs(),
+            keys = player:GetNumKeys(),
+            collectibles = player:GetCollectibleCount(),
         },
         room = {
             index = level:GetCurrentRoomIndex(),
+            type = room:GetType(),
+            shape = room:GetRoomShape(),
             clear = room:IsClear(),
+            frame = room:GetFrameCount(),
             enemies = room:GetAliveEnemiesCount(),
+            grid_width = room:GetGridWidth(),
+            grid_height = room:GetGridHeight(),
+            grid_origin = { round(origin.X), round(origin.Y) },
+            grid = encodeGrid(room),
         },
+        -- Entity rows; field order is documented in tboi_rl/obs.py.
+        enemies = enemies,
+        projectiles = projectiles,
+        pickups = pickups,
+        hazards = hazards,
     }
+end
+
+---------------------------------------------------------------------------
+-- Resets
+---------------------------------------------------------------------------
+
+local function finishReset()
+    reset = nil
+    newRun = true
+    updateCounter = 0
+    currentMove, currentShoot = 0, 0
+end
+
+-- reset message fields:
+--   seed    (optional) restart with this seed, e.g. "JPCX AJ4R"
+--   room    (optional) then teleport to this room, e.g. "d.12" (debug "goto" syntax)
+--   restart (optional, default true) false = only teleport, keep the current run
+local function startReset(msg)
+    currentMove, currentShoot = 0, 0
+    local seed = msg.seed
+    if seed ~= nil and seed ~= "" and not Seeds.IsStringValidSeed(tostring(seed)) then
+        send({ type = "error", message = "invalid seed: " .. tostring(seed) })
+        return
+    end
+    local room = msg.room
+    if room ~= nil and (type(room) ~= "string" or room:find("[%s;]")) then
+        send({ type = "error", message = "invalid room: " .. tostring(room) })
+        return
+    end
+
+    reset = { room = room, startedAt = Isaac.GetFrameCount() }
+    if msg.restart == false then
+        if not room then
+            reset = nil
+            send({ type = "error", message = "reset with restart=false needs a room" })
+            return
+        end
+        reset.phase = "goto"
+        pendingCommand = "goto " .. room
+    else
+        reset.phase = "restart"
+        pendingCommand = (seed and seed ~= "") and ("seed " .. seed) or "restart"
+    end
 end
 
 ---------------------------------------------------------------------------
@@ -181,19 +336,7 @@ local function handleMessage(msg)
         currentMove = clampIndex(msg.move, 8)
         currentShoot = clampIndex(msg.shoot, 4)
     elseif msg.type == "reset" then
-        currentMove, currentShoot = 0, 0
-        if msg.seed and msg.seed ~= "" then
-            local seed = tostring(msg.seed)
-            if not Seeds.IsStringValidSeed(seed) then
-                send({ type = "error", message = "invalid seed: " .. seed })
-                return
-            end
-            pendingCommand = "seed " .. seed
-        else
-            pendingCommand = "restart"
-        end
-        resetting = true
-        resetStartedAt = Isaac.GetFrameCount()
+        startReset(msg)
     else
         Isaac.DebugString("[TBOI-RL] unknown message type: " .. tostring(msg.type))
     end
@@ -222,16 +365,42 @@ end
 ---------------------------------------------------------------------------
 
 function mod:onUpdate()
-    if not hasSocket or not client or resetting then return end
+    if not hasSocket or not client or reset then return end
     updateCounter = updateCounter + 1
     if updateCounter % FRAME_SKIP ~= 0 then return end
     exchange()
 end
 
 function mod:onGameStarted()
-    updateCounter = 0
-    newRun = true
-    resetting = false
+    if not reset or reset.phase ~= "restart" then return end
+    if reset.room then
+        reset.phase = "goto"
+        reset.startedAt = Isaac.GetFrameCount()
+        pendingCommand = "goto " .. reset.room
+    else
+        finishReset()
+    end
+end
+
+function mod:onNewRoom()
+    if reset and reset.phase == "goto"
+        and Game():GetLevel():GetCurrentRoomIndex() == GridRooms.ROOM_DEBUG_IDX then
+        finishReset()
+    end
+end
+
+function mod:onEntityTakeDamage(entity, amount)
+    if entity.Type == EntityType.ENTITY_PLAYER then
+        counters.hits_taken = counters.hits_taken + 1
+    elseif entity:IsActiveEnemy(false) and not entity:HasEntityFlags(EntityFlag.FLAG_FRIENDLY) then
+        counters.damage_dealt = counters.damage_dealt + math.min(amount, math.max(entity.HitPoints, 0))
+    end
+end
+
+function mod:onEntityKill(entity)
+    if entity:IsEnemy() and not entity:HasEntityFlags(EntityFlag.FLAG_FRIENDLY) then
+        counters.kills = counters.kills + 1
+    end
 end
 
 function mod:onInputAction(entity, inputHook, buttonAction)
@@ -264,11 +433,17 @@ function mod:onRender()
         pendingCommand = nil
         local output = Isaac.ExecuteCommand(cmd)
         Isaac.DebugString("[TBOI-RL] ran '" .. cmd .. "': " .. tostring(output))
+        if output and output ~= "" then
+            send({ type = "log", message = cmd .. ": " .. tostring(output) })
+        end
     end
 
-    if resetting and Isaac.GetFrameCount() - resetStartedAt > RESET_TIMEOUT then
-        resetting = false
-        send({ type = "error", message = "reset timed out (the run did not restart)" })
+    local timeout = (reset and reset.phase == "goto") and GOTO_TIMEOUT or RESET_TIMEOUT
+    if reset and Isaac.GetFrameCount() - reset.startedAt > timeout then
+        local phase = reset.phase
+        reset = nil
+        send({ type = "error", message = "reset timed out during " .. phase
+            .. (phase == "goto" and " (does the room exist on this floor?)" or "") })
     end
 
     if not hasSocket then
@@ -286,5 +461,8 @@ end
 
 mod:AddCallback(ModCallbacks.MC_POST_UPDATE, mod.onUpdate)
 mod:AddCallback(ModCallbacks.MC_POST_GAME_STARTED, mod.onGameStarted)
+mod:AddCallback(ModCallbacks.MC_POST_NEW_ROOM, mod.onNewRoom)
+mod:AddCallback(ModCallbacks.MC_ENTITY_TAKE_DMG, mod.onEntityTakeDamage)
+mod:AddCallback(ModCallbacks.MC_POST_ENTITY_KILL, mod.onEntityKill)
 mod:AddCallback(ModCallbacks.MC_INPUT_ACTION, mod.onInputAction)
 mod:AddCallback(ModCallbacks.MC_POST_RENDER, mod.onRender)

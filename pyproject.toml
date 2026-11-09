@@ -4,10 +4,16 @@ version = "0.1.0"
 description = "Reinforcement learning agent for The Binding of Isaac: Repentance"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "gymnasium>=1.4.0",
+    "numpy>=2.4.6",
+]
 
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = [
+    "lupa>=2.8",
+    "pytest>=8",
+]
 
 [build-system]
 requires = ["hatchling"]

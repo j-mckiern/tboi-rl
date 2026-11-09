@@ -8,19 +8,23 @@ an ``action`` or ``reset`` reply before advancing.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import socket
 import time
 from typing import Any
 
+log = logging.getLogger(__name__)
+
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 5577
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 NUM_MOVES = 9   # no-op + 8 directions, clockwise from up
 NUM_SHOOTS = 5  # no-shoot + up, right, down, left
 
 _SEED_RE = re.compile(r"^[A-Z0-9]{4} [A-Z0-9]{4}$")
+_ROOM_RE = re.compile(r"^[a-z]\.[A-Za-z0-9_.]+$")
 
 
 class BridgeError(RuntimeError):
@@ -46,18 +50,35 @@ def action_message(move: int, shoot: int) -> dict[str, Any]:
     return {"type": "action", "move": int(move), "shoot": int(shoot)}
 
 
-def reset_message(seed: str | None = None) -> dict[str, Any]:
-    """Restart the run. ``seed`` uses the in-game format, e.g. ``"JPCX AJ4R"``.
+def reset_message(
+    seed: str | None = None, room: str | None = None, restart: bool = True
+) -> dict[str, Any]:
+    """Start a new episode.
 
-    Seeds include a checksum, so arbitrary strings are rejected by the game;
-    use seeds shown in-game or reported in ``state`` messages.
+    seed:    restart the run with this seed, in the in-game format, e.g.
+             ``"JPCX AJ4R"``. Seeds include a checksum, so arbitrary strings
+             are rejected by the game; use seeds shown in-game or reported
+             in ``state`` messages. ``None`` picks a random seed.
+    room:    after restarting, teleport to this room using the debug console
+             ``goto`` syntax, e.g. ``"d.12"`` for normal room variant 12 of
+             the current floor.
+    restart: ``False`` skips the restart and only teleports, keeping the
+             current run (faster, but health and items carry over).
     """
     msg: dict[str, Any] = {"type": "reset"}
     if seed is not None:
         seed = seed.strip().upper()
         if not _SEED_RE.match(seed):
-            raise ValueError(f"seed must look like 'ABCD 1234', got {seed!r}")
+            raise ValueError(f"seed must look like 'JPCX AJ4R', got {seed!r}")
         msg["seed"] = seed
+    if room is not None:
+        if not _ROOM_RE.match(room):
+            raise ValueError(f"room must use goto syntax like 'd.12', got {room!r}")
+        msg["room"] = room
+    if not restart:
+        if room is None:
+            raise ValueError("restart=False requires a room")
+        msg["restart"] = False
     return msg
 
 
@@ -69,6 +90,7 @@ class BridgeServer:
         self._conn: socket.socket | None = None
         self._reader = None
         self.address = self._listener.getsockname()
+        self.last_log: str | None = None
 
     def wait_for_game(self, timeout: float | None = None) -> dict[str, Any]:
         """Block until the game connects and return its ``hello`` message.
@@ -102,13 +124,19 @@ class BridgeServer:
         if self._conn is None or self._reader is None:
             raise BridgeError("not connected")
         self._conn.settimeout(timeout)
-        line = self._reader.readline()
-        if not line:
-            raise BridgeError("game closed the connection")
-        msg = decode(line)
-        if msg["type"] == "error":
-            raise BridgeError(f"game reported an error: {msg.get('message')}")
-        return msg
+        while True:
+            line = self._reader.readline()
+            if not line:
+                raise BridgeError("game closed the connection")
+            msg = decode(line)
+            if msg["type"] == "log":
+                # Informational output from the game (e.g. console commands).
+                self.last_log = msg.get("message")
+                log.info("game: %s", self.last_log)
+                continue
+            if msg["type"] == "error":
+                raise BridgeError(f"game reported an error: {msg.get('message')}")
+            return msg
 
     def send(self, msg: dict[str, Any]) -> None:
         if self._conn is None:
