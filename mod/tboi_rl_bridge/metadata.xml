@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<metadata>
+    <name>TBOI-RL Bridge</name>
+    <directory>tboi_rl_bridge</directory>
+    <description>Connects the game to an external reinforcement learning agent over a local TCP socket. Requires launching the game with --luadebug.</description>
+    <version>0.1</version>
+    <visibility>Private</visibility>
+</metadata>

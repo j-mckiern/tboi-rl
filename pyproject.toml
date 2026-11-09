@@ -1,0 +1,20 @@
+[project]
+name = "tboi-rl"
+version = "0.1.0"
+description = "Reinforcement learning agent for The Binding of Isaac: Repentance"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["tboi_rl"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
